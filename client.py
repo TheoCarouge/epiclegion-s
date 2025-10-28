@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from keep_alive import keep_alive
+from keepserver import keep_alive
 
 # ---------- Config ----------
 load_dotenv()
@@ -1135,3 +1135,4 @@ async def before_trial_checker():
 if __name__ == "__main__":
     keep_alive()
     bot.run(TOKEN)
+
