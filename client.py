@@ -1,6 +1,8 @@
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+import os, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import aiosqlite
 import discord
@@ -418,6 +420,20 @@ def lead_only():
             return False
         return any(r.id == LEAD_ROLE_ID for r in inter.user.roles)
     return app_commands.check(predicate)
+
+def start_keepalive_server():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Bot is up")
+        def log_message(self, format, *args):
+            return
+
+    port = int(os.getenv("PORT", "8080"))
+    srv = HTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 # ---------- UI: Modal & View ----------
 class PlayerNotesModal(discord.ui.Modal, title="Notes du membre"):
@@ -1131,7 +1147,10 @@ async def before_trial_checker():
 
 # ---------- Run ----------
 if __name__ == "__main__":
+    if os.getenv("PORT"):
+        start_keepalive_server()
     bot.run(TOKEN)
+
 
 
 
