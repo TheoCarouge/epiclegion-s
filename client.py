@@ -36,7 +36,6 @@ class MyBot(commands.Bot):
         print(f"🌐 {len(synced)} cmd sync -> {[c.name for c in synced]}")
 
 bot = MyBot(command_prefix=BOT_PREFIX, intents=INTENTS, help_command=None)
-keep_alive()
 
 # ---------- DB ----------
 CREATE_TABLE_PLAYERS = """
@@ -1133,6 +1132,7 @@ async def before_trial_checker():
 # ---------- Run ----------
 if __name__ == "__main__":
     bot.run(TOKEN)
+
 
 
 
