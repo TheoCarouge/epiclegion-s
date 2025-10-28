@@ -7,9 +7,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from keepserver import keep_alive
-keep_alive()
-
 # ---------- Config ----------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -1134,7 +1131,7 @@ async def before_trial_checker():
 
 # ---------- Run ----------
 if __name__ == "__main__":
-    keep_alive()
     bot.run(TOKEN)
+
 
 
