@@ -435,6 +435,7 @@ async def autocomplete_external_names(interaction: discord.Interaction, current:
 
 # ---------- Slash Commands (EXTERNAL ONLY) ----------
 @app_commands.guilds(TEST_GUILD_ID)
+@lead_only()
 @bot.tree.command(name="checkpseudo", description="Génère le lien du profil Ankama à partir d'un pseudo (ex: pseudo#9999)")
 async def check_pseudo(interaction: discord.Interaction, pseudo: str):
     pseudo = pseudo.strip()
@@ -674,16 +675,6 @@ async def note_form(interaction: discord.Interaction, name: str):
         f"📝 Formulaire de notes pour **{name.strip()}** — clique ci-dessous.",
         view=view, ephemeral=True
     )
-
-@app_commands.guilds(TEST_GUILD_ID)
-@bot.tree.command(name="wipeglobal", description="Efface TOUTES les commandes globales (admin).")
-async def wipe_global(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    bot.tree.clear_commands(guild=None)
-    await bot.tree.sync()
-
-    await interaction.followup.send("✅ Commandes **globales** effacées.")
 
 @app_commands.guilds(TEST_GUILD_ID)
 @lead_only()
