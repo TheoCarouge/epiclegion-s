@@ -29,10 +29,6 @@ LEAD_ROLE_ID = 1282641140750880779
 class MyBot(commands.Bot):
     async def setup_hook(self):
         test_guild = discord.Object(id=TEST_GUILD_ID)
-
-        self.tree.clear_commands(guild=None)
-        await self.tree.sync(guild=test_guild)
-
         synced = await self.tree.sync(guild=test_guild)
         print(f"🧪 Synced {len(synced)} cmds to test guild")
 
@@ -438,9 +434,9 @@ async def autocomplete_external_names(interaction: discord.Interaction, current:
     return results
 
 # ---------- Slash Commands (EXTERNAL ONLY) ----------
+@bot.tree.command(name="checkpseudo", description="Génère le lien du profil Ankama à partir d'un pseudo (ex: pseudo#9999)")
 @app_commands.guilds(TEST_GUILD_ID)
 @lead_only()
-@bot.tree.command(name="checkpseudo", description="Génère le lien du profil Ankama à partir d'un pseudo (ex: pseudo#9999)")
 async def check_pseudo(interaction: discord.Interaction, pseudo: str):
     pseudo = pseudo.strip()
     if not pseudo or "#" not in pseudo:
@@ -453,8 +449,8 @@ async def check_pseudo(interaction: discord.Interaction, pseudo: str):
     url = f"https://account.ankama.com/fr/profil-ankama/{safe_pseudo}"
     await interaction.response.send_message(f"🔗 Profil Ankama : <{url}>")
 
-@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="add", description="Ajoute un joueur à la liste (14 jours d'essai).")
+@app_commands.guilds(TEST_GUILD_ID)
 @lead_only()
 @app_commands.describe(name="Nom du joueur à ajouter")
 async def add_player(interaction: discord.Interaction, name: str):
@@ -467,8 +463,8 @@ async def add_player(interaction: discord.Interaction, name: str):
     await interaction.response.send_message(text)
 "Ajoute-le d'abord avec `/add name:<nom>`."
 
-@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="check", description="Vérifie la période d’essai d’une entrée par nom.")
+@app_commands.guilds(TEST_GUILD_ID)
 @lead_only()
 @app_commands.describe(name="Nom (autocomplete)")
 @app_commands.autocomplete(name=autocomplete_external_names)
@@ -510,8 +506,8 @@ async def check_external(interaction: discord.Interaction, name: str):
             f"- Statut: {status}"
         )
 
-@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="remove", description="Supprime une entrée par nom. Peut supprimer l'entrée et/ou seulement les notes.")
+@app_commands.guilds(TEST_GUILD_ID)
 @lead_only()
 @app_commands.describe(
     name="Nom EXACT (autocomplete)",
@@ -573,9 +569,9 @@ async def remove_entry(
     else:
         await interaction.response.send_message(f"ℹ️ Aucune entrée trouvée pour **{name_display}**.")
 
+@bot.tree.command(name="list", description="Affiche la liste complète (noms uniquement).")
 @app_commands.guilds(TEST_GUILD_ID)
 @lead_only()
-@bot.tree.command(name="list", description="Affiche la liste complète (noms uniquement).")
 async def list_all(interaction: discord.Interaction):
     guild = interaction.guild
     if guild is None:
@@ -652,11 +648,11 @@ class ListPaginator(discord.ui.View):
         else:
             await interaction.response.defer()
 
-@app_commands.guilds(TEST_GUILD_ID)
-@lead_only()
 @bot.tree.command(name="note", description="Ouvre le formulaire de notes (par nom).")
 @app_commands.describe(name="Nom texte (autocomplete)")
 @app_commands.autocomplete(name=autocomplete_external_names)
+@app_commands.guilds(TEST_GUILD_ID)
+@lead_only()
 async def note_form(interaction: discord.Interaction, name: str):
     if interaction.guild is None:
         await interaction.response.send_message("❌ À utiliser dans un serveur.", ephemeral=True)
@@ -680,11 +676,11 @@ async def note_form(interaction: discord.Interaction, name: str):
         view=view, ephemeral=True
     )
 
-@app_commands.guilds(TEST_GUILD_ID)
-@lead_only()
 @bot.tree.command(name="notes", description="Affiche les notes (par nom).")
 @app_commands.describe(name="Nom texte (autocomplete)")
 @app_commands.autocomplete(name=autocomplete_external_names)
+@app_commands.guilds(TEST_GUILD_ID)
+@lead_only()
 async def notes_show(interaction: discord.Interaction, name: str):
     def val(x): return x if (x and str(x).strip()) else "—"
     name_display = name.strip()
@@ -711,11 +707,11 @@ async def notes_show(interaction: discord.Interaction, name: str):
     embed.set_footer(text=f"Dernière mise à jour: {updated}")
     await interaction.response.send_message(embed=embed)
 
-@app_commands.guilds(TEST_GUILD_ID)
-@lead_only()
 @bot.tree.command(name="delnotes", description="Supprime les notes (par nom).")
 @app_commands.describe(name="Nom texte (autocomplete)")
 @app_commands.autocomplete(name=autocomplete_external_names)
+@app_commands.guilds(TEST_GUILD_ID)
+@lead_only()
 async def delnotes(interaction: discord.Interaction, name: str):
     name_key = _normalize_name(name)
     changes = await delete_notes_external(interaction.guild.id, name_key)
@@ -724,10 +720,10 @@ async def delnotes(interaction: discord.Interaction, name: str):
     else:
         await interaction.response.send_message(f"ℹ️ Aucune note à supprimer pour **{name.strip()}**.")
 
-@app_commands.guilds(TEST_GUILD_ID)
-@lead_only()
 @bot.tree.command(name="settrialchannel", description="Définit le salon des rappels J+14.")
 @app_commands.describe(channel="Salon des rappels (laisser vide pour le salon courant)")
+@app_commands.guilds(TEST_GUILD_ID)
+@lead_only()
 async def set_trial_channel_cmd(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
     if interaction.guild is None:
         await interaction.response.send_message("❌ À utiliser dans un serveur.", ephemeral=True)
