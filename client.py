@@ -675,9 +675,13 @@ async def note_form(interaction: discord.Interaction, name: str):
 
 @bot.tree.command(name="wipeglobal", description="Efface TOUTES les commandes globales (admin).")
 async def wipe_global(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     bot.tree.clear_commands(guild=None)
     await bot.tree.sync()
-    await interaction.response.send_message("✅ Commandes **globales** effacées.", ephemeral=True)
+
+    await interaction.followup.send("✅ Commandes **globales** effacées.")
+
 
 @lead_only()
 @bot.tree.command(name="notes", description="Affiche les notes (par nom).")
