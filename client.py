@@ -30,7 +30,7 @@ class MyBot(commands.Bot):
     async def setup_hook(self):
         guild = discord.Object(id=TEST_GUILD_ID)
         print("DEBUG globals before copy:", [c.name for c in self.tree.get_commands()])
-        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
         synced = await self.tree.sync(guild=guild)
         print(f"🌐 {len(synced)} cmd sync -> {[c.name for c in synced]}")
 
@@ -436,6 +436,7 @@ async def autocomplete_external_names(interaction: discord.Interaction, current:
     return results
 
 # ---------- Slash Commands (EXTERNAL ONLY) ----------
+@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="checkpseudo", description="Génère le lien du profil Ankama à partir d'un pseudo (ex: pseudo#9999)")
 async def check_pseudo(interaction: discord.Interaction, pseudo: str):
     pseudo = pseudo.strip()
@@ -450,6 +451,7 @@ async def check_pseudo(interaction: discord.Interaction, pseudo: str):
     await interaction.response.send_message(f"🔗 Profil Ankama : <{url}>")
 
 @lead_only()
+@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="add", description="Ajoute un joueur à la liste (14 jours d'essai).")
 @app_commands.describe(name="Nom du joueur à ajouter")
 async def add_player(interaction: discord.Interaction, name: str):
@@ -462,6 +464,7 @@ async def add_player(interaction: discord.Interaction, name: str):
     await interaction.response.send_message(text)
 
 @lead_only()
+@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="check", description="Vérifie la période d’essai d’une entrée par nom.")
 @app_commands.describe(name="Nom (autocomplete)")
 @app_commands.autocomplete(name=autocomplete_external_names)
@@ -504,6 +507,7 @@ async def check_external(interaction: discord.Interaction, name: str):
         )
 
 @lead_only()
+@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(
     name="remove",
     description="Supprime une entrée par nom. Peut supprimer l'entrée et/ou seulement les notes."
@@ -569,6 +573,7 @@ async def remove_entry(
         await interaction.response.send_message(f"ℹ️ Aucune entrée trouvée pour **{name_display}**.")
 
 @lead_only()
+@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="list", description="Affiche la liste complète (noms uniquement).")
 async def list_all(interaction: discord.Interaction):
     guild = interaction.guild
@@ -647,6 +652,7 @@ class ListPaginator(discord.ui.View):
             await interaction.response.defer()
 
 @lead_only()
+@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="note", description="Ouvre le formulaire de notes (par nom).")
 @app_commands.describe(name="Nom texte (autocomplete)")
 @app_commands.autocomplete(name=autocomplete_external_names)
@@ -663,7 +669,7 @@ async def note_form(interaction: discord.Interaction, name: str):
         ) as cur:
             if not await cur.fetchone():
                 await interaction.response.send_message(
-                    "❌ Ce nom n'est pas dans la liste. Ajoute-le d'abord avec `/enter name:<nom>`",
+                    "❌ Ce nom n'est pas dans la liste. Ajoute-le d'abord avec `/add name:<nom>`",
                     ephemeral=True
                 )
                 return
@@ -673,7 +679,14 @@ async def note_form(interaction: discord.Interaction, name: str):
         view=view, ephemeral=True
     )
 
+@bot.tree.command(name="wipeglobal", description="Efface TOUTES les commandes globales (admin).")
+async def wipe_global(interaction: discord.Interaction):
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync()
+    await interaction.response.send_message("✅ Commandes **globales** effacées.", ephemeral=True)
+
 @lead_only()
+@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="notes", description="Affiche les notes (par nom).")
 @app_commands.describe(name="Nom texte (autocomplete)")
 @app_commands.autocomplete(name=autocomplete_external_names)
@@ -704,6 +717,7 @@ async def notes_show(interaction: discord.Interaction, name: str):
     await interaction.response.send_message(embed=embed)
 
 @lead_only()
+@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="delnotes", description="Supprime les notes (par nom).")
 @app_commands.describe(name="Nom texte (autocomplete)")
 @app_commands.autocomplete(name=autocomplete_external_names)
@@ -716,6 +730,7 @@ async def delnotes(interaction: discord.Interaction, name: str):
         await interaction.response.send_message(f"ℹ️ Aucune note à supprimer pour **{name.strip()}**.")
 
 @lead_only()
+@app_commands.guilds(TEST_GUILD_ID)
 @bot.tree.command(name="settrialchannel", description="Définit le salon des rappels J+14.")
 @app_commands.describe(channel="Salon des rappels (laisser vide pour le salon courant)")
 async def set_trial_channel_cmd(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
