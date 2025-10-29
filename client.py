@@ -29,6 +29,10 @@ LEAD_ROLE_ID = 1282641140750880779
 class MyBot(commands.Bot):
     async def setup_hook(self):
         test_guild = discord.Object(id=TEST_GUILD_ID)
+
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()
+
         synced = await self.tree.sync(guild=test_guild)
         print(f"🧪 Synced {len(synced)} cmds to test guild")
 
