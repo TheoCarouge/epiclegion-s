@@ -1,13 +1,14 @@
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-import os, threading
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from discord.app_commands import AppCommandError, CheckFailure
 from dotenv import load_dotenv
 
 # ---------- Config ----------
@@ -18,7 +19,6 @@ if not TOKEN:
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
-INTENTS.members = True
 
 BOT_PREFIX = "!"
 DB_PATH = "players.db"
@@ -29,50 +29,18 @@ LEAD_ROLE_ID = 1282641140750880779
 class MyBot(commands.Bot):
     async def setup_hook(self):
         guild = discord.Object(id=TEST_GUILD_ID)
-
         print("DEBUG globals before copy:", [c.name for c in self.tree.get_commands()])
-
         self.tree.copy_global_to(guild=guild)
-
         synced = await self.tree.sync(guild=guild)
         print(f"🌐 {len(synced)} cmd sync -> {[c.name for c in synced]}")
 
 bot = MyBot(command_prefix=BOT_PREFIX, intents=INTENTS, help_command=None)
 
 # ---------- DB ----------
-CREATE_TABLE_PLAYERS = """
-CREATE TABLE IF NOT EXISTS players (
-    guild_id        INTEGER NOT NULL,
-    user_id         INTEGER NOT NULL,
-    added_at_utc    TEXT    NOT NULL,
-    trial_end_utc   TEXT    NOT NULL,
-    notes           TEXT    DEFAULT '',
-    notified_done   INTEGER NOT NULL DEFAULT 0,
-    notified_at_utc TEXT    DEFAULT NULL,
-    PRIMARY KEY (guild_id, user_id)
-);
-"""
-
 CREATE_TABLE_SETTINGS = """
 CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id          INTEGER PRIMARY KEY,
     trial_channel_id  INTEGER
-);
-"""
-
-CREATE_TABLE_NOTES = """
-CREATE TABLE IF NOT EXISTS player_notes (
-    guild_id               INTEGER NOT NULL,
-    user_id                INTEGER NOT NULL,
-    characters_level       TEXT    DEFAULT '', -- "Combien de perso/LVL"
-    prev_guild_alliance    TEXT    DEFAULT '', -- "Ancienne guilde/alliance"
-    optimized              TEXT    DEFAULT '', -- "Opti ou pas"
-    content_preference     TEXT    DEFAULT '', -- "Préférence pvp ou pvm"
-    objectives             TEXT    DEFAULT '', -- "Objectif/projets"
-    age                    TEXT    DEFAULT '', -- optionnel
-    contribution           TEXT    DEFAULT '', -- optionnel "Ce que tu amèneras..."
-    updated_at_utc         TEXT    NOT NULL,
-    PRIMARY KEY (guild_id, user_id)
 );
 """
 
@@ -108,24 +76,12 @@ CREATE TABLE IF NOT EXISTS player_notes_external (
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(CREATE_TABLE_PLAYERS)
         await db.execute(CREATE_TABLE_SETTINGS)
-        await db.execute(CREATE_TABLE_NOTES)
         await db.execute(CREATE_TABLE_PLAYERS_EXTERNAL)
         await db.execute(CREATE_TABLE_NOTES_EXTERNAL)
-
-        # Sécurité: ajouter colonnes manquantes si anciens schémas
-        cols = {}
-        async with db.execute("PRAGMA table_info(players)") as cur:
-            for _, name, *_ in await cur.fetchall():
-                cols[name] = True
-        if "notified_done" not in cols:
-            await db.execute("ALTER TABLE players ADD COLUMN notified_done INTEGER NOT NULL DEFAULT 0;")
-        if "notified_at_utc" not in cols:
-            await db.execute("ALTER TABLE players ADD COLUMN notified_at_utc TEXT DEFAULT NULL;")
         await db.commit()
 
-# ---------- DB Ops ----------
+# ---------- DB Ops (EXTERNAL ONLY) ----------
 async def set_trial_channel(guild_id: int, channel_id: Optional[int]):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -141,63 +97,29 @@ async def get_trial_channel_id(guild_id: int) -> Optional[int]:
             row = await cur.fetchone()
             return row[0] if row and row[0] else None
 
-async def add_player_to_db(guild_id: int, user_id: int) -> tuple[bool, str]:
+def _normalize_name(name: str) -> str:
+    return " ".join(name.strip().split()).lower()
+
+async def add_player_by_name(guild_id: int, name: str) -> tuple[bool, str]:
+    norm = _normalize_name(name)
+    if not norm:
+        return (False, "Nom invalide (vide).")
     now_utc = datetime.now(timezone.utc)
     trial_end = now_utc + timedelta(days=14)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT 1 FROM players WHERE guild_id=? AND user_id=?", (guild_id, user_id)
+            "SELECT 1 FROM players_external WHERE guild_id=? AND name_key=?",
+            (guild_id, norm),
         ) as cur:
             if await cur.fetchone():
-                return (False, "Ce membre est déjà dans la liste.")
+                return (False, "Ce nom existe déjà dans la liste. Choisis un autre nom.")
         await db.execute(
-            "INSERT INTO players (guild_id, user_id, added_at_utc, trial_end_utc) VALUES (?, ?, ?, ?)",
-            (guild_id, user_id, now_utc.isoformat(), trial_end.isoformat()),
+            "INSERT INTO players_external (guild_id, name, name_key, added_at_utc, trial_end_utc) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (guild_id, name.strip(), norm, now_utc.isoformat(), trial_end.isoformat()),
         )
         await db.commit()
-    return (True, "Membre ajouté avec succès.")
-
-async def get_player_row(guild_id: int, user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT added_at_utc, trial_end_utc, notes, notified_done, notified_at_utc "
-            "FROM players WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id),
-        ) as cur:
-            return await cur.fetchone()
-
-async def remove_player_from_db(guild_id: int, user_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM players WHERE guild_id=? AND user_id=?", (guild_id, user_id))
-        changes = db.total_changes
-        await db.commit()
-    return changes > 0
-
-async def fetch_due_trials(guild_id: int):
-    now_iso = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id, added_at_utc, trial_end_utc FROM players "
-            "WHERE guild_id=? AND notified_done=0 AND trial_end_utc <= ?",
-            (guild_id, now_iso),
-        ) as cur:
-            return await cur.fetchall()
-
-async def mark_notified(guild_id: int, user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE players SET notified_done=1, notified_at_utc=? WHERE guild_id=? AND user_id=?",
-            (datetime.now(timezone.utc).isoformat(), guild_id, user_id),
-        )
-        await db.commit()
-
-async def fetch_all_discord_players(guild_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id, added_at_utc, trial_end_utc FROM players WHERE guild_id=? ORDER BY added_at_utc ASC",
-            (guild_id,),
-        ) as cur:
-            return await cur.fetchall()
+    return (True, "Entrée ajoutée avec succès.")
 
 async def fetch_all_external_players(guild_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -206,7 +128,27 @@ async def fetch_all_external_players(guild_id: int):
             (guild_id,),
         ) as cur:
             return await cur.fetchall()
-        
+
+async def fetch_due_trials_external(guild_id: int):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT name, added_at_utc, trial_end_utc FROM players_external "
+            "WHERE guild_id=? AND notified_done=0 AND trial_end_utc <= ?",
+            (guild_id, now_iso),
+        ) as cur:
+            return await cur.fetchall()
+
+async def mark_notified_external(guild_id: int, name_key: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE players_external SET notified_done=1, notified_at_utc=? "
+            "WHERE guild_id=? AND name_key=?",
+            (datetime.now(timezone.utc).isoformat(), guild_id, name_key),
+        )
+        await db.commit()
+
+# ---- Notes EXTERNAL ----
 async def upsert_notes_external(
     guild_id: int,
     name_key: str,
@@ -274,106 +216,7 @@ async def delete_notes_external(guild_id: int, name_key: str) -> int:
         await db.commit()
     return changes
 
-# ---- Notes DB ----
-async def upsert_notes(
-    guild_id: int,
-    user_id: int,
-    characters_level: str,
-    prev_guild_alliance: str,
-    optimized: str,
-    content_preference: str,
-    objectives: str,
-    age: str,
-    contribution: str,
-):
-    now_iso = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO player_notes (guild_id, user_id, characters_level, prev_guild_alliance, optimized, "
-            "content_preference, objectives, age, contribution, updated_at_utc) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(guild_id, user_id) DO UPDATE SET "
-            "characters_level=excluded.characters_level, "
-            "prev_guild_alliance=excluded.prev_guild_alliance, "
-            "optimized=excluded.optimized, "
-            "content_preference=excluded.content_preference, "
-            "objectives=excluded.objectives, "
-            "age=excluded.age, "
-            "contribution=excluded.contribution, "
-            "updated_at_utc=excluded.updated_at_utc",
-            (
-                guild_id, user_id,
-                characters_level, prev_guild_alliance, optimized,
-                content_preference, objectives, age, contribution,
-                now_iso,
-            ),
-        )
-        await db.commit()
-
-async def update_optional_notes(guild_id: int, user_id: int, age: str, contribution: str):
-    now_iso = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE player_notes SET age=?, contribution=?, updated_at_utc=? "
-            "WHERE guild_id=? AND user_id=?",
-            (age, contribution, now_iso, guild_id, user_id),
-        )
-        await db.commit()
-
-async def get_notes(guild_id: int, user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT characters_level, prev_guild_alliance, optimized, content_preference, "
-            "objectives, age, contribution, updated_at_utc "
-            "FROM player_notes WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id),
-        ) as cur:
-            return await cur.fetchone()
-        
-async def add_player_by_name(guild_id: int, name: str) -> tuple[bool, str]:
-    norm = _normalize_name(name)
-    if not norm:
-        return (False, "Nom invalide (vide).")
-    now_utc = datetime.now(timezone.utc)
-    trial_end = now_utc + timedelta(days=14)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT 1 FROM players_external WHERE guild_id=? AND name_key=?",
-            (guild_id, norm),
-        ) as cur:
-            if await cur.fetchone():
-                return (False, "Ce nom existe déjà dans la liste. Choisis un autre nom.")
-        await db.execute(
-            "INSERT INTO players_external (guild_id, name, name_key, added_at_utc, trial_end_utc) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (guild_id, name.strip(), norm, now_utc.isoformat(), trial_end.isoformat()),
-        )
-        await db.commit()
-    return (True, "Entrée ajoutée avec succès.")
-
-async def fetch_due_trials_external(guild_id: int):
-    now_iso = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT name, added_at_utc, trial_end_utc FROM players_external "
-            "WHERE guild_id=? AND notified_done=0 AND trial_end_utc <= ?",
-            (guild_id, now_iso),
-        ) as cur:
-            return await cur.fetchall()
-
-async def mark_notified_external(guild_id: int, name_key: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE players_external SET notified_done=1, notified_at_utc=? "
-            "WHERE guild_id=? AND name_key=?",
-            (datetime.now(timezone.utc).isoformat(), guild_id, name_key),
-        )
-        await db.commit()
-
 # ---------- Utils ----------
-def fmt_user(user: discord.abc.User):
-    return f"{user.mention} ({user.name})"
-
 def humanize_timedelta(delta: timedelta) -> str:
     total_seconds = int(abs(delta.total_seconds()))
     minutes, _ = divmod(total_seconds, 60)
@@ -391,9 +234,6 @@ def parse_iso(s: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
-
-def _normalize_name(name: str) -> str:
-    return " ".join(name.strip().split()).lower()
 
 def _status_and_delta(added_iso: str, end_iso: str) -> tuple[str, str]:
     added = parse_iso(added_iso)
@@ -430,196 +270,11 @@ def start_keepalive_server():
             self.wfile.write(b"Bot is up")
         def log_message(self, format, *args):
             return
-
     port = int(os.getenv("PORT", "8080"))
     srv = HTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-# ---------- UI: Modal & View ----------
-class PlayerNotesModal(discord.ui.Modal, title="Notes du membre"):
-    def __init__(self, target_member_id: int):
-        super().__init__(timeout=300)
-        self.target_member_id = target_member_id
-
-        self.characters_level = discord.ui.TextInput(
-            label="Combien de perso / LVL",
-            placeholder="Ex: 3 persos / 200, 199, 180...",
-            style=discord.TextStyle.short,
-            required=True,
-            max_length=200,
-        )
-        self.prev_guild_alliance = discord.ui.TextInput(
-            label="Ancienne guilde / alliance",
-            placeholder="Ex: Guilde X / Alliance Y",
-            style=discord.TextStyle.short,
-            required=False,
-            max_length=200,
-        )
-        self.optimized = discord.ui.TextInput(
-            label="Opti ou pas",
-            placeholder="Ex: Opti PvP, opti PvM, en cours...",
-            style=discord.TextStyle.short,
-            required=False,
-            max_length=200,
-        )
-        self.content_preference = discord.ui.TextInput(
-            label="Préférence de contenu (PvP ou PvM)",
-            placeholder="Ex: Koli, AvA, donjons, succès, farm...",
-            style=discord.TextStyle.short,
-            required=True,
-            max_length=200,
-        )
-        self.objectives = discord.ui.TextInput(
-            label="Objectifs / projets à venir",
-            placeholder="Ex: Monter team, AvA régulier, succès...",
-            style=discord.TextStyle.paragraph,
-            required=True,
-            max_length=1000,
-        )
-
-        self.add_item(self.characters_level)
-        self.add_item(self.prev_guild_alliance)
-        self.add_item(self.optimized)
-        self.add_item(self.content_preference)
-        self.add_item(self.objectives)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("Erreur: serveur introuvable.", ephemeral=True)
-            return
-
-        # On upsert les champs principaux, on laisse les optionnels vides pour l’instant
-        await upsert_notes(
-            guild.id,
-            self.target_member_id,
-            self.characters_level.value.strip(),
-            self.prev_guild_alliance.value.strip(),
-            self.optimized.value.strip(),
-            self.content_preference.value.strip(),
-            self.objectives.value.strip(),
-            age="",  # optionnel non renseigné
-            contribution="",  # optionnel non renseigné
-        )
-
-        # Réponse + bouton pour compléter les infos optionnelles
-        view = OptionalNotesCTAView(self.target_member_id)
-        await interaction.response.send_message(
-            "✅ Notes enregistrées.\n"
-            "Souhaites-tu ajouter les **informations optionnelles** (Âge, Ce que tu amèneras) ?",
-            view=view, ephemeral=True
-        )
-
-class OptionalNotesCTAView(discord.ui.View):
-    def __init__(self, target_member_id: int):
-        super().__init__(timeout=180)
-        self.target_member_id = target_member_id
-
-    @discord.ui.button(label="Ajouter infos optionnelles", style=discord.ButtonStyle.secondary)
-    async def open_optional_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Check permission (même règle que la saisie principale)
-        perms = interaction.user.guild_permissions if interaction.user and interaction.guild else None
-        if not perms or not perms.manage_guild:
-            await interaction.response.send_message(
-                "⛔ Tu dois avoir la permission **Gérer le serveur** pour ajouter ces infos.", ephemeral=True
-            )
-            return
-        await interaction.response.send_modal(OptionalNotesModal(self.target_member_id))
-
-
-class OptionalNotesModal(discord.ui.Modal, title="Infos optionnelles"):
-    def __init__(self, target_member_id: int):
-        super().__init__(timeout=300)
-        self.target_member_id = target_member_id
-
-        self.age = discord.ui.TextInput(
-            label="Âge (optionnel)",
-            placeholder="Ex: 23",
-            style=discord.TextStyle.short,
-            required=False,
-            max_length=10,
-        )
-        self.contribution = discord.ui.TextInput(
-            label="Ce que tu amèneras à la guilde (optionnel)",
-            placeholder="Ex: Organisation d’events, shotcaller, crafts, coaching...",
-            style=discord.TextStyle.paragraph,
-            required=False,
-            max_length=1000,
-        )
-
-        self.add_item(self.age)
-        self.add_item(self.contribution)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("Erreur: serveur introuvable.", ephemeral=True)
-            return
-
-        await update_optional_notes(
-            guild.id,
-            self.target_member_id,
-            self.age.value.strip(),
-            self.contribution.value.strip(),
-        )
-        await interaction.response.send_message("✅ Infos optionnelles enregistrées.", ephemeral=True)
-
-class NotesView(discord.ui.View):
-    def __init__(self, target_member: discord.Member):
-        super().__init__(timeout=300)
-        self.target_member = target_member
-
-    @discord.ui.button(label="Remplir le formulaire de notes", style=discord.ButtonStyle.primary)
-    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        perms = interaction.user.guild_permissions if interaction.user and interaction.guild else None
-        if not perms or not perms.manage_guild:
-            await interaction.response.send_message(
-                "⛔ Tu dois avoir la permission **Gérer le serveur** pour remplir ce formulaire.", ephemeral=True
-            )
-            return
-        await interaction.response.send_modal(PlayerNotesModal(self.target_member.id))
-
-class ListPaginator(discord.ui.View):
-    def __init__(self, pages: list[discord.Embed]):
-        super().__init__(timeout=300)
-        self.pages = pages
-        self.index = 0
-        # Désactiver Prev au début si 1re page
-        self._sync_buttons_state()
-
-    def _sync_buttons_state(self):
-        # active/désactive en fonction de la page
-        self.prev_button.disabled = (self.index == 0)
-        self.next_button.disabled = (self.index >= len(self.pages) - 1)
-
-    async def send(self, ctx: commands.Context):
-        if not self.pages:
-            await ctx.reply("Aucun inscrit dans la liste pour ce serveur.")
-            return
-        msg = await ctx.reply(embed=self.pages[self.index], view=self)
-        self.message = msg
-
-    @discord.ui.button(label="◀ Précédent", style=discord.ButtonStyle.secondary)
-    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user != interaction.message.interaction_user if hasattr(interaction.message, "interaction_user") else False:
-            # On ne restreint pas : tout le monde peut paginer (ou ajoute un check si tu veux)
-            pass
-        if self.index > 0:
-            self.index -= 1
-            self._sync_buttons_state()
-            await interaction.response.edit_message(embed=self.pages[self.index], view=self)
-        else:
-            await interaction.response.defer()
-
-    @discord.ui.button(label="Suivant ▶", style=discord.ButtonStyle.primary)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.index < len(self.pages) - 1:
-            self.index += 1
-            self._sync_buttons_state()
-            await interaction.response.edit_message(embed=self.pages[self.index], view=self)
-        else:
-            await interaction.response.defer()
-
+# ---------- UI: External Modals / Views ----------
 class PlayerNotesModalExternal(discord.ui.Modal, title="Notes (sans mention)"):
     def __init__(self, guild_id: int, name_display: str):
         super().__init__(timeout=300)
@@ -665,7 +320,7 @@ class PlayerNotesModalExternal(discord.ui.Modal, title="Notes (sans mention)"):
         self.add_item(self.objectives)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Optionnel: vérifier que le nom existe dans players_external
+        # Vérifier existence dans players_external
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
                 "SELECT 1 FROM players_external WHERE guild_id=? AND name_key=?",
@@ -767,7 +422,20 @@ async def on_ready():
         trial_checker.start()
     print("Prêt.")
 
-# ---------- Commandes with slashs ----------
+# ---------- Autocomplete ----------
+async def autocomplete_external_names(interaction: discord.Interaction, current: str):
+    guild_id = interaction.guild_id
+    results = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT name FROM players_external WHERE guild_id=? AND name LIKE ? LIMIT 25",
+            (guild_id, f"%{current}%")
+        ) as cur:
+            rows = await cur.fetchall()
+            results = [app_commands.Choice(name=r[0], value=r[0]) for r in rows]
+    return results
+
+# ---------- Slash Commands (EXTERNAL ONLY) ----------
 @bot.tree.command(name="checkpseudo", description="Génère le lien du profil Ankama à partir d'un pseudo (ex: pseudo#9999)")
 async def check_pseudo(interaction: discord.Interaction, pseudo: str):
     pseudo = pseudo.strip()
@@ -777,60 +445,42 @@ async def check_pseudo(interaction: discord.Interaction, pseudo: str):
             ephemeral=True
         )
         return
-
     safe_pseudo = pseudo.replace("#", "-")
     url = f"https://account.ankama.com/fr/profil-ankama/{safe_pseudo}"
     await interaction.response.send_message(f"🔗 Profil Ankama : <{url}>")
 
 @lead_only()
-@bot.tree.command(name="sync", description="Resynchronise les commandes slash (owner only)")
-async def sync_cmd(interaction: discord.Interaction):
-    app_owner = (await bot.application_info()).owner
-    if interaction.user.id != app_owner.id:
-        await interaction.response.send_message("⛔ Réservé au propriétaire de l'application.", ephemeral=True)
-        return
-    if interaction.guild:
-        await bot.tree.sync(guild=interaction.guild)
-        await interaction.response.send_message(f"✅ Sync effectuée pour la guilde {interaction.guild.id}", ephemeral=True)
-    else:
-        await bot.tree.sync()
-        await interaction.response.send_message("✅ Sync globale déclenchée.", ephemeral=True)
-
-@lead_only()
-@bot.tree.command(name="enter", description="Ajoute un joueur (mention ou nom texte).")
-@app_commands.describe(member="Membre à ajouter (optionnel)", name="Nom texte si pas de mention (optionnel)")
-async def enter_unified(interaction: discord.Interaction, member: discord.Member | None = None, name: str | None = None):
+@bot.tree.command(name="add", description="Ajoute un joueur à la liste (14 jours d'essai).")
+@app_commands.describe(name="Nom du joueur à ajouter")
+async def add_player(interaction: discord.Interaction, name: str):
     if interaction.guild is None:
         await interaction.response.send_message("❌ À utiliser dans un serveur.", ephemeral=True)
         return
 
-    if member is not None:
-        created, msg = await add_player_to_db(interaction.guild.id, member.id)
-        text = f"✅ {fmt_user(member)} ajouté (14j)." if created else f"⚠️ {msg}"
-        await interaction.response.send_message(text)
-        return
-
-    if name and name.strip():
-        created, msg = await add_player_by_name(interaction.guild.id, name)
-        text = f"✅ **{name.strip()}** ajouté (14j)." if created else f"⚠️ {msg}"
-        await interaction.response.send_message(text)
-        return
-
-    await interaction.response.send_message("❌ Usage : `/enter member:@membre` ou `/enter name:<nom>`", ephemeral=True)
+    created, msg = await add_player_by_name(interaction.guild.id, name)
+    text = f"✅ **{name.strip()}** ajouté à la liste pour 14 jours." if created else f"⚠️ {msg}"
+    await interaction.response.send_message(text)
 
 @lead_only()
-@bot.tree.command(name="check", description="Vérifie la période d’essai d’un membre Discord.")
-@app_commands.describe(member="Membre à vérifier")
-async def check_member(interaction: discord.Interaction, member: discord.Member):
-    row = await get_player_row(interaction.guild.id, member.id) if interaction.guild else None
+@bot.tree.command(name="check", description="Vérifie la période d’essai d’une entrée par nom.")
+@app_commands.describe(name="Nom (autocomplete)")
+@app_commands.autocomplete(name=autocomplete_external_names)
+async def check_external(interaction: discord.Interaction, name: str):
+    name_display = name.strip()
+    name_key = _normalize_name(name_display)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT added_at_utc, trial_end_utc FROM players_external WHERE guild_id=? AND name_key=?",
+            (interaction.guild.id, name_key),
+        ) as cur:
+            row = await cur.fetchone()
     if not row:
-        await interaction.response.send_message(f"ℹ️ {fmt_user(member)} n'est **pas** dans la liste.")
+        await interaction.response.send_message(f"ℹ️ **{name_display}** n'est pas dans la liste.")
         return
 
     added_at_utc = parse_iso(row[0])
     trial_end_utc = parse_iso(row[1])
     now_utc = datetime.now(timezone.utc)
-
     since = now_utc - added_at_utc
     remaining = trial_end_utc - now_utc
     status = "✅ **Période d’essai terminée**" if remaining.total_seconds() <= 0 else "🟡 **En période d’essai**"
@@ -839,7 +489,7 @@ async def check_member(interaction: discord.Interaction, member: discord.Member)
     if remaining.total_seconds() > 0:
         txt_remaining = humanize_timedelta(remaining)
         await interaction.response.send_message(
-            f"👤 {fmt_user(member)}\n"
+            f"👤 **{name_display}**\n"
             f"- Ajouté il y a **{txt_since}** (UTC: {added_at_utc.strftime('%Y-%m-%d %H:%M')})\n"
             f"- Fin d’essai dans **{txt_remaining}** (UTC: {trial_end_utc.strftime('%Y-%m-%d %H:%M')})\n"
             f"- Statut: {status}"
@@ -847,41 +497,87 @@ async def check_member(interaction: discord.Interaction, member: discord.Member)
     else:
         ended_for = humanize_timedelta(-remaining)
         await interaction.response.send_message(
-            f"👤 {fmt_user(member)}\n"
+            f"👤 **{name_display}**\n"
             f"- Ajouté il y a **{txt_since}** (UTC: {added_at_utc.strftime('%Y-%m-%d %H:%M')})\n"
             f"- Période d’essai terminée depuis **{ended_for}** (UTC: {trial_end_utc.strftime('%Y-%m-%d %H:%M')})\n"
             f"- Statut: {status}"
         )
 
 @lead_only()
-@bot.tree.command(name="leave", description="Retire un membre Discord de la liste.")
-@app_commands.describe(member="Membre à retirer")
-async def leave_member(interaction: discord.Interaction, member: discord.Member):
-    removed = await remove_player_from_db(interaction.guild.id, member.id)
-    if removed:
-        await interaction.response.send_message(f"🗑️ {fmt_user(member)} a été retiré de la liste.")
+@bot.tree.command(
+    name="remove",
+    description="Supprime une entrée par nom. Peut supprimer l'entrée et/ou seulement les notes."
+)
+@app_commands.describe(
+    name="Nom EXACT (autocomplete)",
+    notes_only="Supprimer uniquement les notes ? (défaut: non)",
+    delete_notes="Si on supprime l'entrée, supprimer aussi ses notes ? (défaut: oui)"
+)
+@app_commands.autocomplete(name=autocomplete_external_names)
+async def remove_entry(
+    interaction: discord.Interaction,
+    name: str,
+    notes_only: bool = False,
+    delete_notes: bool = True,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ À utiliser dans un serveur.", ephemeral=True)
+        return
+
+    name_display = name.strip()
+    name_key = _normalize_name(name_display)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        deleted_main = 0
+        deleted_notes = 0
+
+        if notes_only:
+            before = db.total_changes
+            await db.execute(
+                "DELETE FROM player_notes_external WHERE guild_id=? AND name_key=?",
+                (interaction.guild.id, name_key),
+            )
+            await db.commit()
+            deleted_notes = db.total_changes - before
+            if deleted_notes > 0:
+                await interaction.response.send_message(f"🗑️ Notes supprimées pour **{name_display}**.", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"ℹ️ Aucune note à supprimer pour **{name_display}**.", ephemeral=True)
+            return
+
+        before = db.total_changes
+        await db.execute(
+            "DELETE FROM players_external WHERE guild_id=? AND name_key=?",
+            (interaction.guild.id, name_key),
+        )
+        await db.commit()
+        deleted_main = db.total_changes - before
+
+        if delete_notes:
+            before = db.total_changes
+            await db.execute(
+                "DELETE FROM player_notes_external WHERE guild_id=? AND name_key=?",
+                (interaction.guild.id, name_key),
+            )
+            await db.commit()
+            deleted_notes = db.total_changes - before
+
+    if deleted_main > 0:
+        extra = f" (+{deleted_notes} note(s) supprimée(s))" if delete_notes and deleted_notes > 0 else ""
+        await interaction.response.send_message(f"🗑️ **{name_display}** retiré de la liste{extra}.")
     else:
-        await interaction.response.send_message(f"ℹ️ {fmt_user(member)} n’était pas dans la liste.")
+        await interaction.response.send_message(f"ℹ️ Aucune entrée trouvée pour **{name_display}**.")
 
 @lead_only()
-@bot.tree.command(name="list", description="Affiche la liste complète (Discord + noms).")
+@bot.tree.command(name="list", description="Affiche la liste complète (noms uniquement).")
 async def list_all(interaction: discord.Interaction):
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message("Cette commande doit être utilisée dans un serveur.", ephemeral=True)
         return
 
-    disc_rows = await fetch_all_discord_players(guild.id)
     ext_rows  = await fetch_all_external_players(guild.id)
-
     en_essai_lines, termines_lines = [], []
-
-    for user_id, added_iso, end_iso in disc_rows:
-        member = guild.get_member(user_id)
-        display = member.mention if member else f"<@{user_id}>"
-        status, delta = _status_and_delta(added_iso, end_iso)
-        line = f"{display} — {status} — {delta}"
-        (en_essai_lines if "En essai" in status else termines_lines).append(line)
 
     for name, added_iso, end_iso in ext_rows:
         display = f"**{name}**"
@@ -921,130 +617,103 @@ async def list_all(interaction: discord.Interaction):
     view = ListPaginator(pages)
     await interaction.response.send_message(embed=pages[0], view=view)
 
+class ListPaginator(discord.ui.View):
+    def __init__(self, pages: list[discord.Embed]):
+        super().__init__(timeout=300)
+        self.pages = pages
+        self.index = 0
+        self._sync_buttons_state()
+
+    def _sync_buttons_state(self):
+        self.prev_button.disabled = (self.index == 0)
+        self.next_button.disabled = (self.index >= len(self.pages) - 1)
+
+    @discord.ui.button(label="◀ Précédent", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.index > 0:
+            self.index -= 1
+            self._sync_buttons_state()
+            await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="Suivant ▶", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.index < len(self.pages) - 1:
+            self.index += 1
+            self._sync_buttons_state()
+            await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+        else:
+            await interaction.response.defer()
+
 @lead_only()
-@bot.tree.command(name="note", description="Ouvre le formulaire de notes (mention ou nom).")
-@app_commands.describe(member="Membre (optionnel)", name="Nom texte (optionnel)")
-async def note_form(interaction: discord.Interaction, member: discord.Member | None = None, name: str | None = None):
+@bot.tree.command(name="note", description="Ouvre le formulaire de notes (par nom).")
+@app_commands.describe(name="Nom texte (autocomplete)")
+@app_commands.autocomplete(name=autocomplete_external_names)
+async def note_form(interaction: discord.Interaction, name: str):
     if interaction.guild is None:
         await interaction.response.send_message("❌ À utiliser dans un serveur.", ephemeral=True)
         return
-
-    if member:
-        view = NotesView(member)
-        await interaction.response.send_message(
-            f"📝 Formulaire de notes pour {fmt_user(member)} — clique ci-dessous.",
-            view=view, ephemeral=True
-        )
-        return
-
-    if name and name.strip():
-        name_key = _normalize_name(name)
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT 1 FROM players_external WHERE guild_id=? AND name_key=?",
-                (interaction.guild.id, name_key),
-            ) as cur:
-                if not await cur.fetchone():
-                    await interaction.response.send_message(
-                        "❌ Ce nom n'est pas dans la liste. Ajoute-le d'abord avec `/enter name:<nom>`",
-                        ephemeral=True
-                    )
-                    return
-        view = NotesViewExternal(interaction.guild.id, name.strip())
-        await interaction.response.send_message(
-            f"📝 Formulaire de notes pour **{name.strip()}** — clique ci-dessous.",
-            view=view, ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message("❌ Usage : `/note member:@membre` ou `/note name:<nom>`", ephemeral=True)
+    # s’assurer que le nom existe
+    name_key = _normalize_name(name)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM players_external WHERE guild_id=? AND name_key=?",
+            (interaction.guild.id, name_key),
+        ) as cur:
+            if not await cur.fetchone():
+                await interaction.response.send_message(
+                    "❌ Ce nom n'est pas dans la liste. Ajoute-le d'abord avec `/enter name:<nom>`",
+                    ephemeral=True
+                )
+                return
+    view = NotesViewExternal(interaction.guild.id, name.strip())
+    await interaction.response.send_message(
+        f"📝 Formulaire de notes pour **{name.strip()}** — clique ci-dessous.",
+        view=view, ephemeral=True
+    )
 
 @lead_only()
-@bot.tree.command(name="notes", description="Affiche les notes (mention ou nom).")
-@app_commands.describe(member="Membre (optionnel)", name="Nom texte (optionnel)")
-async def notes_show(interaction: discord.Interaction, member: discord.Member | None = None, name: str | None = None):
+@bot.tree.command(name="notes", description="Affiche les notes (par nom).")
+@app_commands.describe(name="Nom texte (autocomplete)")
+@app_commands.autocomplete(name=autocomplete_external_names)
+async def notes_show(interaction: discord.Interaction, name: str):
     def val(x): return x if (x and str(x).strip()) else "—"
-
-    if member:
-        row = await get_notes(interaction.guild.id, member.id)
-        if not row:
-            await interaction.response.send_message(f"ℹ️ Aucune note trouvée pour {fmt_user(member)}.")
-            return
-        (characters_level, prev_guild_alliance, optimized, content_preference,
-         objectives, age, contribution, updated_at_iso) = row
-        updated = parse_iso(updated_at_iso).strftime("%Y-%m-%d %H:%M UTC")
-        embed = discord.Embed(
-            title=f"Notes — {member.display_name}",
-            color=discord.Color.blue(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Combien de perso / LVL", value=val(characters_level), inline=False)
-        embed.add_field(name="Ancienne guilde / alliance", value=val(prev_guild_alliance), inline=False)
-        embed.add_field(name="Opti ou pas", value=val(optimized), inline=False)
-        embed.add_field(name="Préférence PvP / PvM", value=val(content_preference), inline=False)
-        embed.add_field(name="Objectifs / projets", value=val(objectives), inline=False)
-        embed.add_field(name="Âge (optionnel)", value=val(age), inline=True)
-        embed.add_field(name="Apport à la guilde (optionnel)", value=val(contribution), inline=False)
-        embed.set_footer(text=f"Dernière mise à jour: {updated}")
-        await interaction.response.send_message(embed=embed)
+    name_display = name.strip()
+    name_key = _normalize_name(name_display)
+    row = await get_notes_external(interaction.guild.id, name_key)
+    if not row:
+        await interaction.response.send_message(f"ℹ️ Aucune note trouvée pour **{name_display}**.")
         return
-
-    if name and name.strip():
-        name_display = name.strip()
-        name_key = _normalize_name(name_display)
-        row = await get_notes_external(interaction.guild.id, name_key)
-        if not row:
-            await interaction.response.send_message(f"ℹ️ Aucune note trouvée pour **{name_display}**.")
-            return
-        (stored_name, characters_level, prev_guild_alliance, optimized, content_preference,
-         objectives, age, contribution, updated_at_iso) = row
-        updated = parse_iso(updated_at_iso).strftime("%Y-%m-%d %H:%M UTC")
-        embed = discord.Embed(
-            title=f"Notes — {stored_name}",
-            color=discord.Color.blue(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Combien de perso / LVL", value=val(characters_level), inline=False)
-        embed.add_field(name="Ancienne guilde / alliance", value=val(prev_guild_alliance), inline=False)
-        embed.add_field(name="Opti ou pas", value=val(optimized), inline=False)
-        embed.add_field(name="Préférence PvP / PvM", value=val(content_preference), inline=False)
-        embed.add_field(name="Objectifs / projets", value=val(objectives), inline=False)
-        embed.add_field(name="Âge (optionnel)", value=val(age), inline=True)
-        embed.add_field(name="Apport à la guilde (optionnel)", value=val(contribution), inline=False)
-        embed.set_footer(text=f"Dernière mise à jour: {updated}")
-        await interaction.response.send_message(embed=embed)
-        return
-
-    await interaction.response.send_message("❌ Usage : `/notes member:@membre` ou `/notes name:<nom>`", ephemeral=True)
+    (stored_name, characters_level, prev_guild_alliance, optimized, content_preference,
+     objectives, age, contribution, updated_at_iso) = row
+    updated = parse_iso(updated_at_iso).strftime("%Y-%m-%d %H:%M UTC")
+    embed = discord.Embed(
+        title=f"Notes — {stored_name}",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="Combien de perso / LVL", value=val(characters_level), inline=False)
+    embed.add_field(name="Ancienne guilde / alliance", value=val(prev_guild_alliance), inline=False)
+    embed.add_field(name="Opti ou pas", value=val(optimized), inline=False)
+    embed.add_field(name="Préférence PvP / PvM", value=val(content_preference), inline=False)
+    embed.add_field(name="Objectifs / projets", value=val(objectives), inline=False)
+    embed.add_field(name="Âge (optionnel)", value=val(age), inline=True)
+    embed.add_field(name="Apport à la guilde (optionnel)", value=val(contribution), inline=False)
+    embed.set_footer(text=f"Dernière mise à jour: {updated}")
+    await interaction.response.send_message(embed=embed)
 
 @lead_only()
-@bot.tree.command(name="delnotes", description="Supprime les notes (mention ou nom).")
-@app_commands.describe(member="Membre (optionnel)", name="Nom texte (optionnel)")
-async def delnotes(interaction: discord.Interaction, member: discord.Member | None = None, name: str | None = None):
-    if member:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "DELETE FROM player_notes WHERE guild_id=? AND user_id=?",
-                (interaction.guild.id, member.id),
-            )
-            changes = db.total_changes
-            await db.commit()
-        if changes > 0:
-            await interaction.response.send_message(f"🗑️ Notes supprimées pour {fmt_user(member)}.")
-        else:
-            await interaction.response.send_message(f"ℹ️ Aucune note à supprimer pour {fmt_user(member)}.")
-        return
-
-    if name and name.strip():
-        name_key = _normalize_name(name)
-        changes = await delete_notes_external(interaction.guild.id, name_key)
-        if changes > 0:
-            await interaction.response.send_message(f"🗑️ Notes supprimées pour **{name.strip()}**.")
-        else:
-            await interaction.response.send_message(f"ℹ️ Aucune note à supprimer pour **{name.strip()}**.")
-        return
-
-    await interaction.response.send_message("❌ Usage : `/delnotes member:@membre` ou `/delnotes name:<nom>`", ephemeral=True)
+@bot.tree.command(name="delnotes", description="Supprime les notes (par nom).")
+@app_commands.describe(name="Nom texte (autocomplete)")
+@app_commands.autocomplete(name=autocomplete_external_names)
+async def delnotes(interaction: discord.Interaction, name: str):
+    name_key = _normalize_name(name)
+    changes = await delete_notes_external(interaction.guild.id, name_key)
+    if changes > 0:
+        await interaction.response.send_message(f"🗑️ Notes supprimées pour **{name.strip()}**.")
+    else:
+        await interaction.response.send_message(f"ℹ️ Aucune note à supprimer pour **{name.strip()}**.")
 
 @lead_only()
 @bot.tree.command(name="settrialchannel", description="Définit le salon des rappels J+14.")
@@ -1057,48 +726,22 @@ async def set_trial_channel_cmd(interaction: discord.Interaction, channel: Optio
     await set_trial_channel(interaction.guild.id, target.id)
     await interaction.response.send_message(f"🛠️ Salon des rappels défini sur {target.mention}")
 
-@bot.tree.command(name="gettrialchannel", description="Affiche le salon des rappels J+14.")
-async def get_trial_channel_cmd(interaction: discord.Interaction):
-    channel_id = await get_trial_channel_id(interaction.guild.id)
-    if channel_id:
-        ch = interaction.guild.get_channel(channel_id)
-        await interaction.response.send_message(f"Salon des rappels: {ch.mention if ch else f'#{channel_id} (introuvable)'}")
-    else:
-        await interaction.response.send_message("Aucun salon de rappel configuré. Utilise `/settrialchannel`.")
-
-async def autocomplete_external_names(interaction: discord.Interaction, current: str):
-    # Retourne une liste de app_commands.Choice[str]
-    guild_id = interaction.guild_id
-    results = []
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT name FROM players_external WHERE guild_id=? AND name LIKE ? LIMIT 25",
-            (guild_id, f"%{current}%")
-        ) as cur:
-            rows = await cur.fetchall()
-            results = [app_commands.Choice(name=r[0], value=r[0]) for r in rows]
-    return results
-
+# ---------- Error handler ----------
 @bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: Exception):
-    import traceback
-    print("❌ Erreur slash command :")
-    traceback.print_exception(type(error), error, error.__traceback__)
+async def on_app_command_error(interaction: discord.Interaction, error: AppCommandError):
+    if isinstance(error, CheckFailure):
+        if interaction.response.is_done():
+            await interaction.followup.send("⛔ Commande réservée aux **Leads**.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⛔ Commande réservée aux **Leads**.", ephemeral=True)
+        return
+    # fallback générique
     try:
         await interaction.response.send_message("❌ Une erreur est survenue.", ephemeral=True)
     except discord.InteractionResponded:
         await interaction.followup.send("❌ Une erreur est survenue.", ephemeral=True)
 
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure):
-        # évite "interaction already responded"
-        if interaction.response.is_done():
-            await interaction.followup.send("⛔ Commande réservée aux **Leads**.", ephemeral=True)
-        else:
-            await interaction.response.send_message("⛔ Commande réservée aux **Leads**.", ephemeral=True)
-
-# ---------- Rappels J+14 ----------
+# ---------- Rappels J+14 (EXTERNAL ONLY) ----------
 @tasks.loop(minutes=5.0)
 async def trial_checker():
     for guild in bot.guilds:
@@ -1113,20 +756,6 @@ async def trial_checker():
             continue
 
         try:
-            # 1) Membres Discord (user_id)
-            due_rows = await fetch_due_trials(guild.id)
-            if due_rows:
-                for user_id, added_iso, trial_end_iso in due_rows:
-                    member = guild.get_member(user_id)
-                    mention = member.mention if member else f"<@{user_id}>"
-                    added_at = parse_iso(added_iso)
-                    await channel.send(
-                        f"🔔 {mention} n'est plus en période d’essai "
-                        f"(14 jours écoulés depuis {added_at.strftime('%Y-%m-%d')})."
-                    )
-                    await mark_notified(guild.id, user_id)
-
-            # 2) Entrées par NOM (sans compte Discord)
             due_ext = await fetch_due_trials_external(guild.id)
             if due_ext:
                 for name, added_iso, trial_end_iso in due_ext:
@@ -1135,9 +764,7 @@ async def trial_checker():
                         f"🔔 **{name}** n'est plus en période d’essai "
                         f"(14 jours écoulés depuis {added_at.strftime('%Y-%m-%d')})."
                     )
-                    # Marquer notifié via name_key normalisé
                     await mark_notified_external(guild.id, _normalize_name(name))
-
         except Exception as e:
             print(f"[trial_checker] Erreur sur guild {guild.id}: {e}")
 
@@ -1150,9 +777,3 @@ if __name__ == "__main__":
     if os.getenv("PORT"):
         start_keepalive_server()
     bot.run(TOKEN)
-
-
-
-
-
-
